@@ -32,6 +32,15 @@ function statusFromProgress(progress: number): SubTaskStatus {
   return 'IN_PROGRESS';
 }
 
+const STATUS_LABEL: Record<SubTaskStatus, string> = {
+  TODO: 'Not started',
+  IN_PROGRESS: 'In progress',
+  DONE: 'Completed',
+};
+
+const formatDay = (date: Date | null) =>
+  date ? date.toISOString().slice(0, 10) : 'none';
+
 function progressFromStatus(status: SubTaskStatus): number | null {
   if (status === 'DONE') return 100;
   if (status === 'TODO') return 0;
@@ -157,22 +166,62 @@ export class SubtasksService {
         include: relations,
       });
       const changes: string[] = [];
+      if (task.progress !== current.progress)
+        changes.push(`progress ${current.progress}% → ${task.progress}%`);
       if (task.status !== current.status)
-        changes.push(`status ${current.status} → ${task.status}`);
+        changes.push(
+          `status ${STATUS_LABEL[current.status]} → ${STATUS_LABEL[task.status]}`,
+        );
       if (task.assignedToId !== current.assignedToId)
         changes.push(`reassigned to ${task.assignedTo.name}`);
-      if (task.title !== current.title) changes.push('title changed');
-      if (input.dueDate !== undefined) changes.push('due date changed');
+      if (task.title !== current.title)
+        changes.push(`title "${current.title}" → "${task.title}"`);
+      if (
+        input.description !== undefined &&
+        (task.description ?? '') !== (current.description ?? '')
+      )
+        changes.push('description edited');
+      if (formatDay(task.dueDate) !== formatDay(current.dueDate))
+        changes.push(
+          `due date ${formatDay(current.dueDate)} → ${formatDay(task.dueDate)}`,
+        );
       if (input.priority !== undefined && task.priority !== current.priority)
         changes.push(`priority ${current.priority} → ${task.priority}`);
-      if (changes.length)
+      const note = input.comment?.trim();
+      const completed = task.status === 'DONE' && current.status !== 'DONE';
+      const reopened = task.status !== 'DONE' && current.status === 'DONE';
+      if (changes.length || note) {
+        const action = completed
+          ? 'SUBTASK_COMPLETED'
+          : reopened
+            ? 'SUBTASK_REOPENED'
+            : task.progress !== current.progress
+              ? 'SUBTASK_PROGRESS'
+              : changes.length
+                ? 'SUBTASK_UPDATED'
+                : 'SUBTASK_NOTE';
+        const headline = completed
+          ? `Completed sub-task "${task.title}"`
+          : reopened
+            ? `Reopened sub-task "${task.title}"`
+            : `Sub-task "${task.title}"`;
+        // The first line is the headline; any further lines are the user's note.
+        const summary = [
+          changes.length
+            ? `${headline}: ${changes.join('; ')}.`
+            : `${headline}: note added.`,
+          note ? `Note: ${note}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
         await this.activity.record(tx, {
           engagementId: task.engagementId,
           actorId: actor.id,
           subTaskId: task.id,
-          action: 'SUBTASK_UPDATED',
-          summary: `Sub-task "${task.title}": ${changes.join('; ')}.`,
+          action,
+          summary,
         });
+      }
       const reassigned = task.assignedToId !== current.assignedToId;
       if (reassigned)
         await this.notifications.notify(tx, {
