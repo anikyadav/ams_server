@@ -17,6 +17,13 @@ export const loginSchema = z.strictObject({
 
 export class LoginDto extends createZodDto(loginSchema) {}
 
+export const changePasswordSchema = z.strictObject({
+  currentPassword: z.string().min(1).max(256),
+  newPassword: passwordSchema,
+});
+
+export class ChangePasswordDto extends createZodDto(changePasswordSchema) {}
+
 export const createStaffSchema = z.strictObject({
   name: z.string().trim().min(1).max(120),
   email: z.string().trim().pipe(emailSchema),

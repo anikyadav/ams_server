@@ -5,7 +5,8 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import type { Environment } from '../config/environment';
 import { AuthController } from './auth.controller';
-import { AuthService } from './auth.service';
+import { AuthService, SESSION_SECONDS } from './auth.service';
+import { LoginThrottle } from './login-throttle';
 import { JwtStrategy } from './jwt.strategy';
 import { JwtAuthGuard, RolesGuard } from './auth.guards';
 
@@ -18,7 +19,7 @@ import { JwtAuthGuard, RolesGuard } from './auth.guards';
         secret: config.get('JWT_SECRET', { infer: true }),
         signOptions: {
           algorithm: 'HS256',
-          expiresIn: '1h',
+          expiresIn: SESSION_SECONDS,
           issuer: 'audit-practice-api',
           audience: 'audit-practice-app',
         },
@@ -28,6 +29,7 @@ import { JwtAuthGuard, RolesGuard } from './auth.guards';
   controllers: [AuthController],
   providers: [
     AuthService,
+    LoginThrottle,
     JwtStrategy,
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: RolesGuard },

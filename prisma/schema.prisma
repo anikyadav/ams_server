@@ -36,6 +36,8 @@ model User {
   engagements  Engagement[] @relation("PrimaryStaff")
   subTasks     SubTask[]
   comments     Comment[]
+  activity     ActivityLog[]
+  notifications Notification[]
   createdAt    DateTime     @default(now())
 }
 
@@ -80,6 +82,8 @@ model Engagement {
   priority     String?
   subTasks     SubTask[]
   comments     Comment[]
+  activity     ActivityLog[]
+  notifications Notification[]
   createdAt    DateTime         @default(now())
 
   @@index([clientId])
@@ -106,6 +110,7 @@ model SubTask {
   assignedTo   User          @relation(fields: [assignedToId], references: [id], onDelete: Restrict)
   assignedToId String
   comments     Comment[]
+  completedAt  DateTime?
   createdAt    DateTime      @default(now())
 
   @@index([engagementId])
@@ -125,4 +130,37 @@ model Comment {
 
   @@index([engagementId, createdAt])
   @@index([subTaskId])
+}
+
+model ActivityLog {
+  id           String     @id @default(cuid())
+  engagement   Engagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  engagementId String
+  actor        User       @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  actorId      String
+  subTaskId    String?
+  action       String
+  summary      String
+  createdAt    DateTime   @default(now())
+
+  @@index([engagementId, createdAt])
+  @@index([subTaskId])
+}
+
+model Notification {
+  id           String      @id @default(cuid())
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String
+  type         String
+  title        String
+  message      String
+  engagement   Engagement? @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  engagementId String?
+  subTaskId    String?
+  dedupeKey    String?
+  readAt       DateTime?
+  createdAt    DateTime    @default(now())
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, readAt, createdAt])
 }

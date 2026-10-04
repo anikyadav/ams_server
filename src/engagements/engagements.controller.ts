@@ -1,4 +1,4 @@
-﻿import {
+import {
   Body,
   Controller,
   Delete,
@@ -51,8 +51,8 @@ export class EngagementsController {
   @Post()
   @Roles('AUDITOR')
   @ApiCreatedResponse({ description: 'Engagement created' })
-  create(@Body() body: CreateEngagementDto) {
-    return this.engagements.create(body);
+  create(@Body() body: CreateEngagementDto, @Actor() actor: CurrentUser) {
+    return this.engagements.create(body, actor.id);
   }
 
   @Patch(':id/progress')
@@ -68,8 +68,20 @@ export class EngagementsController {
   @Patch(':id')
   @Roles('AUDITOR')
   @ApiOkResponse({ description: 'Engagement updated' })
-  update(@Param('id') id: string, @Body() body: UpdateEngagementDto) {
-    return this.engagements.update(id, body);
+  update(
+    @Param('id') id: string,
+    @Body() body: UpdateEngagementDto,
+    @Actor() actor: CurrentUser,
+  ) {
+    return this.engagements.update(id, body, actor.id);
+  }
+
+  @Get(':id/activity')
+  @ApiOkResponse({
+    description: 'Change history of an engagement, newest first',
+  })
+  activity(@Param('id') id: string, @Actor() actor: CurrentUser) {
+    return this.engagements.activityFor(id, actor);
   }
 
   @Get(':id/subtasks')
@@ -81,8 +93,12 @@ export class EngagementsController {
   @Post(':id/subtasks')
   @Roles('AUDITOR')
   @ApiCreatedResponse({ description: 'Subtask created on engagement' })
-  createSubTask(@Param('id') id: string, @Body() body: CreateSubTaskDto) {
-    return this.subtasks.create(id, body);
+  createSubTask(
+    @Param('id') id: string,
+    @Body() body: CreateSubTaskDto,
+    @Actor() actor: CurrentUser,
+  ) {
+    return this.subtasks.create(id, body, actor.id);
   }
 
   @Delete(':id')

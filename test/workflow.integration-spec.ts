@@ -988,6 +988,54 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
       ).toBe(before);
     });
 
+    it('limits non-primary staff to their own tasks and notifies assignees', async () => {
+      const engagement = await createEngagement(otherId);
+      const mine = await createSubTask(engagement.id, staffId, 'My task');
+      await createSubTask(engagement.id, otherId, 'Colleague task');
+
+      const staffView = await call(
+        'get',
+        `/engagements/${engagement.id}`,
+        workerToken,
+      ).expect(200);
+      const visible = staffView.body as {
+        subTasks: { id: string }[];
+        comments: { subTaskId: string | null }[];
+      };
+      expect(visible.subTasks.map((task) => task.id)).toEqual([mine.id]);
+
+      const primaryLogin = await request(server())
+        .post('/auth/login')
+        .send({ email: 'other@test.example', password })
+        .expect(200);
+      const primaryToken = (primaryLogin.body as { accessToken: string })
+        .accessToken;
+      const primaryView = await call(
+        'get',
+        `/engagements/${engagement.id}`,
+        primaryToken,
+      ).expect(200);
+      expect((primaryView.body as { subTasks: unknown[] }).subTasks).toHaveLength(2);
+
+      await call('get', `/subtasks/${mine.id}`, workerToken).expect(200);
+      await call('get', `/subtasks/${mine.id}/activity`, workerToken).expect(200);
+
+      const inbox = await call('get', '/notifications', workerToken).expect(200);
+      const body = inbox.body as {
+        unreadCount: number;
+        items: { id: string; type: string; subTaskId: string | null }[];
+      };
+      expect(body.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'TASK_ASSIGNED', subTaskId: mine.id }),
+        ]),
+      );
+      expect(body.unreadCount).toBeGreaterThan(0);
+      await call('post', '/notifications/read-all', workerToken).expect(204);
+      const after = await call('get', '/notifications', workerToken).expect(200);
+      expect((after.body as { unreadCount: number }).unreadCount).toBe(0);
+    });
+
     it('denies staff subtask creation/deletion and hides other staff subtasks', async () => {
       const engagement = await createEngagement(otherId);
       const hidden = await createSubTask(engagement.id, otherId);

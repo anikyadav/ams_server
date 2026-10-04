@@ -8,6 +8,7 @@ import { Prisma } from '../generated/prisma/client';
 import { engagementVisibilityWhere, safeUserSelect } from '../auth/access';
 import type { CurrentUser } from '../auth/access';
 import { PrismaService } from '../prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { CreateCommentDto, UpdateCommentDto } from './comments.dto';
 
 const relations = {
@@ -19,6 +20,7 @@ export class CommentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly fiscal: FiscalScope,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async listByEngagement(engagementId: string, actor: CurrentUser) {
@@ -62,16 +64,48 @@ export class CommentsService {
     actor: CurrentUser,
   ) {
     await this.assertViewable(scope.engagementId, actor);
-    return this.prisma.comment.create({
-      data: {
-        text: input.text,
-        author: { connect: { id: actor.id } },
-        engagement: { connect: { id: scope.engagementId } },
-        subTask: scope.subTaskId
-          ? { connect: { id: scope.subTaskId } }
-          : undefined,
-      },
-      include: relations,
+    return this.prisma.$transaction(async (tx) => {
+      const comment = await tx.comment.create({
+        data: {
+          text: input.text,
+          author: { connect: { id: actor.id } },
+          engagement: { connect: { id: scope.engagementId } },
+          subTask: scope.subTaskId
+            ? { connect: { id: scope.subTaskId } }
+            : undefined,
+        },
+        include: relations,
+      });
+      const engagement = await tx.engagement.findUniqueOrThrow({
+        where: { id: scope.engagementId },
+        select: {
+          staffId: true,
+          natureOfWork: true,
+          client: { select: { name: true } },
+          subTasks: { select: { id: true, assignedToId: true, title: true } },
+        },
+      });
+      const task = scope.subTaskId
+        ? engagement.subTasks.find((item) => item.id === scope.subTaskId)
+        : undefined;
+      await this.notifications.notify(tx, {
+        userIds: [
+          ...(await this.notifications.auditorIds(tx)),
+          engagement.staffId,
+          ...(task
+            ? [task.assignedToId]
+            : engagement.subTasks.map((item) => item.assignedToId)),
+        ],
+        actorId: actor.id,
+        type: 'COMMENT',
+        title: task
+          ? `New comment on "${task.title}"`
+          : `New comment on ${engagement.client.name}`,
+        message: `${actor.name}: ${input.text.slice(0, 140)}`,
+        engagementId: scope.engagementId,
+        subTaskId: scope.subTaskId,
+      });
+      return comment;
     });
   }
 

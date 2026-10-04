@@ -1,4 +1,4 @@
-﻿import { FiscalYearsModule } from './fiscal-years/fiscal-years.module';
+import { FiscalYearsModule } from './fiscal-years/fiscal-years.module';
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_PIPE } from '@nestjs/core';
@@ -8,6 +8,8 @@ import { ClientsModule } from './clients/clients.module';
 import { EngagementsModule } from './engagements/engagements.module';
 import { SubtasksModule } from './subtasks/subtasks.module';
 import { CommentsModule } from './comments/comments.module';
+import { ActivityModule } from './activity/activity.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { HealthController } from './health/health.controller';
 import { PrismaExceptionFilter } from './common/prisma-exception.filter';
@@ -21,6 +23,8 @@ import { validateEnvironment } from './config/environment';
       validate: validateEnvironment,
     }),
     PrismaModule,
+    ActivityModule,
+    NotificationsModule,
     FiscalYearsModule,
     AuthModule,
     UsersModule,

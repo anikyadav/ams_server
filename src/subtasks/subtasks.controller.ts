@@ -1,7 +1,8 @@
-﻿import {
+import {
   Body,
   Controller,
   Delete,
+  Get,
   HttpCode,
   Param,
   Patch,
@@ -18,6 +19,16 @@ import { SubtasksService } from './subtasks.service';
 export class SubtasksController {
   constructor(private readonly subtasks: SubtasksService) {}
 
+  @Get(':id')
+  findOne(@Param('id') id: string, @Actor() actor: CurrentUser) {
+    return this.subtasks.findOne(id, actor);
+  }
+
+  @Get(':id/activity')
+  activity(@Param('id') id: string, @Actor() actor: CurrentUser) {
+    return this.subtasks.activityFor(id, actor);
+  }
+
   @Patch(':id')
   update(
     @Param('id') id: string,
@@ -31,7 +42,7 @@ export class SubtasksController {
   @Roles('AUDITOR')
   @HttpCode(204)
   @ApiNoContentResponse({ description: 'Subtask deleted' })
-  remove(@Param('id') id: string) {
-    return this.subtasks.remove(id);
+  remove(@Param('id') id: string, @Actor() actor: CurrentUser) {
+    return this.subtasks.remove(id, actor.id);
   }
 }
