@@ -1,6 +1,11 @@
 import { FiscalScope } from '../fiscal-years/fiscal-years.module';
 import { defaultEngagementTasks } from './default-tasks';
 import {
+  completionFromTasks,
+  lockEngagementWorkflow,
+  syncEngagementCompletion,
+} from './completion';
+import {
   BadRequestException,
   Injectable,
   NotFoundException,
@@ -39,21 +44,14 @@ function withProgress<
   T extends {
     manualProgress: number | null;
     status: string;
-    subTasks: { progress: number }[];
+    subTasks: { status: string; progress: number }[];
   },
 >(record: T) {
   return {
     ...record,
-    progress:
-      record.status === 'COMPLETE' || record.status === 'DELIVERED'
-        ? 100
-        : (record.manualProgress ??
-          (record.subTasks.length
-            ? Math.round(
-                record.subTasks.reduce((sum, task) => sum + task.progress, 0) /
-                  record.subTasks.length,
-              )
-            : 0)),
+    progress: record.subTasks.length
+      ? completionFromTasks(record.subTasks).progress
+      : (record.manualProgress ?? 0),
   };
 }
 
@@ -125,6 +123,10 @@ export class EngagementsService {
   }
 
   async create(input: CreateEngagementDto, actorId: string) {
+    if (input.status === 'COMPLETE' || input.status === 'DELIVERED')
+      throw new BadRequestException(
+        'Complete all sub-tasks before completing or delivering an engagement',
+      );
     if (this.fiscal.id === 'legacy')
       throw new BadRequestException(
         'Select a fiscal year before creating new records',
@@ -217,6 +219,20 @@ export class EngagementsService {
       );
   }
 
+  private async assertTasksComplete(
+    tx: Prisma.TransactionClient,
+    engagementId: string,
+  ) {
+    const tasks = await tx.subTask.findMany({
+      where: { engagementId },
+      select: { title: true, status: true, progress: true },
+    });
+    if (!completionFromTasks(tasks).complete)
+      throw new BadRequestException(
+        'Complete all sub-tasks before completing or delivering the engagement',
+      );
+  }
+
   async updateProgress(
     id: string,
     input: UpdateEngagementProgressDto,
@@ -231,6 +247,10 @@ export class EngagementsService {
       const current = await tx.engagement.findFirst({ where });
       if (!current)
         throw new NotFoundException('Assigned engagement not found');
+      if (await tx.subTask.count({ where: { engagementId: id } }))
+        throw new BadRequestException(
+          'Engagement progress follows its sub-tasks. Complete their activities to update progress.',
+        );
       if (current.status === 'DELIVERED')
         throw new BadRequestException(
           'Delivered engagements must be reopened by an auditor before updating progress',
@@ -342,13 +362,10 @@ export class EngagementsService {
 
     return withProgress(
       await this.prisma.$transaction(async (tx) => {
-        if (
-          (input.status === 'COMPLETE' || input.status === 'DELIVERED') &&
-          input.status !== current.status &&
-          current.status !== 'COMPLETE' &&
-          current.status !== 'DELIVERED'
-        )
-          await this.assertSignedOff(tx, id);
+        await lockEngagementWorkflow(tx, id);
+        if (input.status === 'COMPLETE' || input.status === 'DELIVERED')
+          await this.assertTasksComplete(tx, id);
+        if (input.status === 'DELIVERED') await this.assertSignedOff(tx, id);
         const updated = await tx.engagement.update({
           where: { id, fiscalYearId: this.fiscal.id },
           data: {
@@ -414,7 +431,11 @@ export class EngagementsService {
             message: `${label}: ${changes.join('; ')}.`,
             engagementId: id,
           });
-        return updated;
+        await syncEngagementCompletion(tx, id, actorId);
+        return tx.engagement.findUniqueOrThrow({
+          where: { id },
+          include: relations,
+        });
       }),
     );
   }

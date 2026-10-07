@@ -1,6 +1,10 @@
 import { FiscalScope } from '../fiscal-years/fiscal-years.module';
 import { isRequiredTask } from '../engagements/default-tasks';
 import {
+  lockEngagementWorkflow,
+  syncEngagementCompletion,
+} from '../engagements/completion';
+import {
   BadRequestException,
   ForbiddenException,
   Injectable,
@@ -68,6 +72,7 @@ export class SubtasksService {
     });
     await this.assertAssigneeIsStaff(input.assignedToId);
     return this.prisma.$transaction(async (tx) => {
+      await lockEngagementWorkflow(tx, engagementId);
       const task = await tx.subTask.create({
         data: {
           engagement: { connect: { id: engagementId } },
@@ -95,6 +100,7 @@ export class SubtasksService {
         engagementId,
         subTaskId: task.id,
       });
+      await syncEngagementCompletion(tx, engagementId, actorId);
       return task;
     });
   }
@@ -165,6 +171,16 @@ export class SubtasksService {
     this.assertValidProgress(input.progress);
     const data = this.resolveFields(current, input, actor);
     return this.prisma.$transaction(async (tx) => {
+      await lockEngagementWorkflow(tx, current.engagementId);
+      if (input.progress !== undefined || input.status !== undefined) {
+        const activities = await tx.taskChecklistItem.count({
+          where: { subTaskId: id },
+        });
+        if (activities)
+          throw new BadRequestException(
+            'Sub-task progress follows its activities. Complete or reopen activities to change progress.',
+          );
+      }
       const task = await tx.subTask.update({
         where: {
           id,
@@ -290,6 +306,7 @@ export class SubtasksService {
           },
         });
       }
+      await syncEngagementCompletion(tx, task.engagementId, actor.id);
       return task;
     });
   }
@@ -479,6 +496,7 @@ export class SubtasksService {
     const approve = input.decision === 'APPROVE';
     const now = new Date();
     return this.prisma.$transaction(async (tx) => {
+      await lockEngagementWorkflow(tx, current.engagementId);
       const task = await tx.subTask.update({
         where: { id },
         data: approve
@@ -533,6 +551,27 @@ export class SubtasksService {
         engagementId: task.engagementId,
         subTaskId: task.id,
       });
+      if (!approve) {
+        const lastActivity = await tx.taskChecklistItem.findFirst({
+          where: { subTaskId: id, done: true },
+          orderBy: [{ sortOrder: 'desc' }, { id: 'desc' }],
+        });
+        if (lastActivity) {
+          await tx.taskChecklistItem.update({
+            where: { id: lastActivity.id },
+            data: { done: false, doneAt: null, doneById: null },
+          });
+          await this.activity.record(tx, {
+            engagementId: task.engagementId,
+            subTaskId: id,
+            actorId: actor.id,
+            action: 'SUBTASK_CHECKLIST',
+            summary: `Reopened activity "${lastActivity.text}" after changes were requested.`,
+          });
+          return this.syncProgress(tx, id, actor);
+        }
+      }
+      await syncEngagementCompletion(tx, task.engagementId, actor.id);
       return task;
     });
   }
@@ -552,6 +591,7 @@ export class SubtasksService {
     const sortOrder =
       Math.max(0, ...task.checklist.map((item) => item.sortOrder)) + 10;
     return this.prisma.$transaction(async (tx) => {
+      await lockEngagementWorkflow(tx, task.engagementId);
       await tx.taskChecklistItem.create({
         data: { subTaskId: taskId, text: input.text, sortOrder },
       });
@@ -560,7 +600,7 @@ export class SubtasksService {
         actorId: actor.id,
         subTaskId: taskId,
         action: 'SUBTASK_CHECKLIST',
-        summary: `Added step "${input.text}" to "${task.title}".`,
+        summary: `Added activity "${input.text}" to "${task.title}".`,
       });
       return this.syncProgress(tx, taskId, actor);
     });
@@ -582,9 +622,12 @@ export class SubtasksService {
     if (actor.role === 'STAFF') {
       if (item.subTask.assignedToId !== actor.id) throw new NotFoundException();
       if (input.text !== undefined)
-        throw new ForbiddenException('STAFF can only tick or untick steps');
+        throw new ForbiddenException(
+          'STAFF can only complete or reopen activities',
+        );
     }
     return this.prisma.$transaction(async (tx) => {
+      await lockEngagementWorkflow(tx, item.subTask.engagementId);
       await tx.taskChecklistItem.update({
         where: { id: itemId },
         data: {
@@ -606,7 +649,7 @@ export class SubtasksService {
           actorId: actor.id,
           subTaskId: item.subTaskId,
           action: 'SUBTASK_CHECKLIST',
-          summary: `${input.done ? 'Completed' : 'Reopened'} step "${item.text}" on "${item.subTask.title}" (${siblings.filter((entry) => entry.done).length}/${siblings.length}).`,
+          summary: `${input.done ? 'Completed' : 'Reopened'} activity "${item.text}" on "${item.subTask.title}" (${siblings.filter((entry) => entry.done).length}/${siblings.length}).`,
         });
       }
       return this.syncProgress(tx, item.subTaskId, actor);
@@ -623,21 +666,21 @@ export class SubtasksService {
     });
     if (!item) throw new NotFoundException();
     return this.prisma.$transaction(async (tx) => {
+      await lockEngagementWorkflow(tx, item.subTask.engagementId);
       await tx.taskChecklistItem.delete({ where: { id: itemId } });
       await this.activity.record(tx, {
         engagementId: item.subTask.engagementId,
         actorId: actor.id,
         subTaskId: item.subTaskId,
         action: 'SUBTASK_CHECKLIST',
-        summary: `Removed step "${item.text}" from "${item.subTask.title}".`,
+        summary: `Removed activity "${item.text}" from "${item.subTask.title}".`,
       });
       return this.syncProgress(tx, item.subTaskId, actor);
     });
   }
 
   /**
-   * With steps, progress follows them: each quarter of the steps moves the task
-   * one milestone, and the last step completes it (submitting it for review).
+   * Activities determine progress. An empty list never completes a task.
    */
   private async syncProgress(
     tx: Prisma.TransactionClient,
@@ -649,11 +692,18 @@ export class SubtasksService {
       include: { checklist: { select: { done: true } } },
     });
     const total = task.checklist.length;
-    if (total) {
+    {
       const done = task.checklist.filter((item) => item.done).length;
       const progress =
-        done === total ? 100 : Math.floor((done / total) * 4) * 25;
-      if (progress !== task.progress) {
+        total === 0
+          ? 0
+          : done === total
+            ? 100
+            : Math.min(99, Math.round((done / total) * 100));
+      if (
+        progress !== task.progress ||
+        statusFromProgress(progress) !== task.status
+      ) {
         const status = statusFromProgress(progress);
         const updated = await tx.subTask.update({
           where: { id: taskId },
@@ -678,13 +728,14 @@ export class SubtasksService {
             subTaskId: taskId,
             action: completed ? 'SUBTASK_COMPLETED' : 'SUBTASK_REOPENED',
             summary: completed
-              ? `Completed sub-task "${task.title}": all steps done${updated.reviewState === 'SUBMITTED' ? '; submitted for review' : ''}.`
-              : `Reopened sub-task "${task.title}": a step is no longer done.`,
+              ? `Completed sub-task "${task.title}": all activities complete${updated.reviewState === 'SUBMITTED' ? '; submitted for review' : ''}.`
+              : `Reopened sub-task "${task.title}": activities remain incomplete.`,
           });
         if (actor.role === 'STAFF' && completed)
           await this.notifyProgress(tx, updated, actor);
       }
     }
+    await syncEngagementCompletion(tx, task.engagementId, actor.id);
     return tx.subTask.findUniqueOrThrow({
       where: { id: taskId },
       include: relations,
@@ -702,6 +753,7 @@ export class SubtasksService {
       );
     try {
       await this.prisma.$transaction(async (tx) => {
+        await lockEngagementWorkflow(tx, existing.engagementId);
         const task = await tx.subTask.delete({
           where: { id, engagement: { fiscalYearId: this.fiscal.id } },
         });
@@ -720,6 +772,7 @@ export class SubtasksService {
           message: `"${task.title}" was removed from your work.`,
           engagementId: task.engagementId,
         });
+        await syncEngagementCompletion(tx, task.engagementId, actorId);
       });
     } catch {
       throw new NotFoundException();

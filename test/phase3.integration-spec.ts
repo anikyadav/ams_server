@@ -34,6 +34,7 @@ type Task = {
 type EngagementBody = {
   id: string;
   status: string;
+  progress: number;
   subTasks: Task[];
   documentRequests: { id: string; title: string; status: string }[];
   startDate: string | null;
@@ -164,7 +165,7 @@ describe('Phase 3: sign-off, blocked flag, checklist, requests, mentions, clonin
     }
   });
 
-  it('staff completion is submitted for review; the auditor approves or sends it back; completion needs sign-off', async () => {
+  it('staff completion is submitted for review; delivery needs sign-off', async () => {
     const engagement = await newEngagement('Sign-off audit');
     const doc = taskOf(engagement, 'DOCUMENT');
     expect(doc.reviewState).toBe('NOT_SUBMITTED');
@@ -185,7 +186,7 @@ describe('Phase 3: sign-off, blocked flag, checklist, requests, mentions, clonin
       ),
     ).toContain('TASK_SUBMITTED');
 
-    // An engagement cannot be completed until every compulsory task is approved.
+    // An engagement cannot be completed while other sub-tasks remain unfinished.
     const blocked = await call(
       'patch',
       `/engagements/${engagement.id}`,
@@ -193,9 +194,7 @@ describe('Phase 3: sign-off, blocked flag, checklist, requests, mentions, clonin
     )
       .send({ status: 'COMPLETE' })
       .expect(400);
-    expect(JSON.stringify(blocked.body)).toContain(
-      'Compulsory tasks need auditor approval',
-    );
+    expect(JSON.stringify(blocked.body)).toContain('Complete all sub-tasks');
     await call('patch', `/engagements/${engagement.id}/progress`, 'staff')
       .send({ progress: 100 })
       .expect(400);
@@ -322,7 +321,151 @@ describe('Phase 3: sign-off, blocked flag, checklist, requests, mentions, clonin
     });
   });
 
-  it('derives task progress from checklist steps and enforces who may edit them', async () => {
+  it('rolls activity completion up to sub-tasks and engagement, including concurrent final activities and reopening', async () => {
+    const engagement = await newEngagement('Activity completion audit');
+    const activities: Array<{ taskId: string; itemId: string }> = [];
+    for (const task of engagement.subTasks) {
+      const added = await call(
+        'post',
+        `/subtasks/${task.id}/checklist`,
+        'auditor',
+      )
+        .send({ text: `Finish ${task.title}` })
+        .expect(201);
+      activities.push({
+        taskId: task.id,
+        itemId: (added.body as Task).checklist[0].id,
+      });
+    }
+    await call('patch', `/subtasks/${activities[0].taskId}`, 'staff')
+      .send({ status: 'DONE' })
+      .expect(400);
+    await call('patch', `/engagements/${engagement.id}/progress`, 'staff')
+      .send({ progress: 100 })
+      .expect(400);
+    for (const item of activities.slice(0, -2))
+      await call('patch', `/checklist-items/${item.itemId}`, 'staff')
+        .send({ done: true })
+        .expect(200);
+    expect((await fetchEngagement(engagement.id)).status).toBe('IN_PROGRESS');
+    await Promise.all(
+      activities
+        .slice(-2)
+        .map((item) =>
+          call('patch', `/checklist-items/${item.itemId}`, 'staff')
+            .send({ done: true })
+            .expect(200),
+        ),
+    );
+    const complete = await fetchEngagement(engagement.id);
+    expect(complete).toMatchObject({ status: 'COMPLETE', progress: 100 });
+    expect(complete.subTasks.every((task) => task.status === 'DONE')).toBe(
+      true,
+    );
+    // Completion is automatic; separate auditor approval still gates delivery.
+    await call('patch', `/engagements/${engagement.id}`, 'auditor')
+      .send({ status: 'DELIVERED' })
+      .expect(400);
+    await call('patch', `/checklist-items/${activities[0].itemId}`, 'staff')
+      .send({ done: false })
+      .expect(200);
+    expect((await fetchEngagement(engagement.id)).status).toBe('IN_PROGRESS');
+    await call('patch', `/checklist-items/${activities[0].itemId}`, 'staff')
+      .send({ done: true })
+      .expect(200);
+    const added = await call(
+      'post',
+      `/subtasks/${activities[0].taskId}/checklist`,
+      'auditor',
+    )
+      .send({ text: 'Additional evidence' })
+      .expect(201);
+    expect(added.body).toMatchObject({ status: 'IN_PROGRESS', progress: 50 });
+    expect((await fetchEngagement(engagement.id)).status).toBe('IN_PROGRESS');
+    const extra = (added.body as Task).checklist.find(
+      (item) => item.text === 'Additional evidence',
+    )!;
+    await call('delete', `/checklist-items/${extra.id}`, 'auditor').expect(200);
+    expect((await fetchEngagement(engagement.id)).status).toBe('COMPLETE');
+    const rejected = await call(
+      'post',
+      `/subtasks/${activities[1].taskId}/review`,
+      'auditor',
+    )
+      .send({ decision: 'REQUEST_CHANGES', note: 'Fix supporting evidence' })
+      .expect(201);
+    expect(rejected.body).toMatchObject({
+      status: 'TODO',
+      progress: 0,
+      reviewState: 'CHANGES_REQUESTED',
+    });
+    expect((rejected.body as Task).checklist[0].done).toBe(false);
+    expect((await fetchEngagement(engagement.id)).status).toBe('IN_PROGRESS');
+    await call('patch', `/checklist-items/${activities[1].itemId}`, 'staff')
+      .send({ done: true })
+      .expect(200);
+    for (const item of activities.filter(
+      (item) =>
+        complete.subTasks.find((task) => task.id === item.taskId)
+          ?.reviewState === 'SUBMITTED' && item.taskId !== activities[0].taskId,
+    ))
+      await call('post', `/subtasks/${item.taskId}/review`, 'auditor')
+        .send({ decision: 'APPROVE' })
+        .expect(201);
+    await call('patch', `/engagements/${engagement.id}`, 'auditor')
+      .send({ status: 'DELIVERED' })
+      .expect(200);
+    await call(
+      'delete',
+      `/checklist-items/${activities[0].itemId}`,
+      'auditor',
+    ).expect(200);
+    const reopened = await fetchEngagement(engagement.id);
+    expect(reopened.status).toBe('IN_PROGRESS');
+    expect(
+      reopened.subTasks.find((task) => task.id === activities[0].taskId),
+    ).toMatchObject({ status: 'TODO', progress: 0 });
+    const trail = await call(
+      'get',
+      `/engagements/${engagement.id}/activity`,
+      'auditor',
+    ).expect(200);
+    expect(
+      (trail.body as { action: string }[]).map((entry) => entry.action),
+    ).toEqual(
+      expect.arrayContaining(['ENGAGEMENT_COMPLETED', 'ENGAGEMENT_REOPENED']),
+    );
+  });
+
+  it('calculates activity progress accurately for three activities', async () => {
+    const engagement = await newEngagement('Three activities audit');
+    const task = engagement.subTasks[0];
+    let current = task;
+    for (const text of ['Collect', 'Verify', 'File'])
+      current = (
+        await call('post', `/subtasks/${task.id}/checklist`, 'auditor')
+          .send({ text })
+          .expect(201)
+      ).body as Task;
+    const first = await call(
+      'patch',
+      `/checklist-items/${current.checklist[0].id}`,
+      'staff',
+    )
+      .send({ done: true })
+      .expect(200);
+    expect(first.body).toMatchObject({ progress: 33, status: 'IN_PROGRESS' });
+    const second = await call(
+      'patch',
+      `/checklist-items/${current.checklist[1].id}`,
+      'staff',
+    )
+      .send({ done: true })
+      .expect(200);
+    expect(second.body).toMatchObject({ progress: 67, status: 'IN_PROGRESS' });
+  });
+
+  it('derives task progress from activities and enforces who may edit them', async () => {
     const engagement = await newEngagement('Checklist audit');
     const task = taskOf(engagement, 'SALES_RECO');
     let current: Task = task;
