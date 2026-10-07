@@ -11,6 +11,8 @@ export class PrismaService
 {
   constructor(config: ConfigService<Environment, true>) {
     super({
+      // Multi-step workflows (sign-off, checklist, copying) outlast Prisma's 5s default on a remote database.
+      transactionOptions: { timeout: 15_000, maxWait: 10_000 },
       adapter: new PrismaPg(
         {
           connectionString: config.get('DATABASE_URL', { infer: true }),

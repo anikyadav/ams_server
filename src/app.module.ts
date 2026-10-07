@@ -8,6 +8,7 @@ import { ClientsModule } from './clients/clients.module';
 import { EngagementsModule } from './engagements/engagements.module';
 import { SubtasksModule } from './subtasks/subtasks.module';
 import { CommentsModule } from './comments/comments.module';
+import { RequestsModule } from './requests/requests.module';
 import { ActivityModule } from './activity/activity.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -32,6 +33,7 @@ import { validateEnvironment } from './config/environment';
     EngagementsModule,
     SubtasksModule,
     CommentsModule,
+    RequestsModule,
   ],
   controllers: [HealthController],
   providers: [

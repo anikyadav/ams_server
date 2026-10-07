@@ -1,4 +1,5 @@
 import { FiscalScope } from '../fiscal-years/fiscal-years.module';
+import { defaultEngagementTasks } from './default-tasks';
 import {
   BadRequestException,
   Injectable,
@@ -6,6 +7,8 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import { CurrentUser, safeUserSelect } from '../auth/access';
+import { subTaskInclude } from '../subtasks/subtask-include';
+import { isRequiredTask } from './default-tasks';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityService } from '../activity/activity.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -19,7 +22,11 @@ const relations = {
   client: true,
   staff: { select: safeUserSelect },
   subTasks: {
-    include: { assignedTo: { select: safeUserSelect } },
+    include: subTaskInclude,
+    orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+  },
+  documentRequests: {
+    include: { receivedBy: { select: safeUserSelect } },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   },
   comments: {
@@ -138,44 +145,76 @@ export class EngagementsService {
     if (startDate && targetDate && targetDate < startDate)
       throw new BadRequestException('Target date cannot precede start date');
     return withProgress(
-      await this.prisma.$transaction(async (tx) => {
-        const created = await tx.engagement.create({
-          data: {
-            fiscalYear: { connect: { id: this.fiscal.id } },
-            client: {
-              connect: {
-                id_fiscalYearId: {
-                  id: input.clientId,
-                  fiscalYearId: this.fiscal.id,
+      await this.prisma.$transaction(
+        async (tx) => {
+          const created = await tx.engagement.create({
+            data: {
+              fiscalYear: { connect: { id: this.fiscal.id } },
+              client: {
+                connect: {
+                  id_fiscalYearId: {
+                    id: input.clientId,
+                    fiscalYearId: this.fiscal.id,
+                  },
                 },
               },
+              staff: { connect: { id: input.staffId } },
+              natureOfWork: input.natureOfWork,
+              subTasks: { create: defaultEngagementTasks(input.staffId) },
+              status: input.status,
+              startDate,
+              targetDate,
+              priority: input.priority,
             },
-            staff: { connect: { id: input.staffId } },
-            natureOfWork: input.natureOfWork,
-            status: input.status,
-            startDate,
-            targetDate,
-            priority: input.priority,
-          },
-          include: relations,
-        });
-        await this.activity.record(tx, {
-          engagementId: created.id,
-          actorId,
-          action: 'ENGAGEMENT_CREATED',
-          summary: `Created engagement "${created.natureOfWork}" for ${created.client.name}, assigned to ${created.staff.name}.`,
-        });
-        await this.notifications.notify(tx, {
-          userIds: [created.staffId],
-          actorId,
-          type: 'ENGAGEMENT_ASSIGNED',
-          title: 'New engagement assigned',
-          message: `${created.client.name} — ${created.natureOfWork}`,
-          engagementId: created.id,
-        });
-        return created;
-      }),
+            include: relations,
+          });
+          await this.activity.record(tx, {
+            engagementId: created.id,
+            actorId,
+            action: 'ENGAGEMENT_CREATED',
+            summary: `Created engagement "${created.natureOfWork}" for ${created.client.name}, assigned to ${created.staff.name}.`,
+          });
+          await tx.activityLog.createMany({
+            data: created.subTasks.map((task) => ({
+              engagementId: created.id,
+              actorId,
+              subTaskId: task.id,
+              action: 'SUBTASK_CREATED',
+              summary: `Created compulsory sub-task "${task.title}" assigned to ${created.staff.name}.`,
+            })),
+          });
+          await this.notifications.notify(tx, {
+            userIds: [created.staffId],
+            actorId,
+            type: 'ENGAGEMENT_ASSIGNED',
+            title: 'New engagement assigned',
+            message: `${created.client.name} — ${created.natureOfWork}`,
+            engagementId: created.id,
+          });
+          return created;
+        },
+        { timeout: 15_000 },
+      ),
     );
+  }
+
+  /** Compulsory tasks must be signed off before an engagement can be completed. */
+  private async assertSignedOff(
+    tx: Prisma.TransactionClient,
+    engagementId: string,
+  ) {
+    const tasks = await tx.subTask.findMany({
+      where: { engagementId },
+      select: { title: true, templateKey: true, reviewState: true },
+    });
+    const pending = tasks.filter(
+      (task) =>
+        isRequiredTask(task.templateKey) && task.reviewState !== 'APPROVED',
+    );
+    if (pending.length)
+      throw new BadRequestException(
+        `Compulsory tasks need auditor approval before completion: ${pending.map((task) => task.title).join(', ')}`,
+      );
   }
 
   async updateProgress(
@@ -196,6 +235,7 @@ export class EngagementsService {
         throw new BadRequestException(
           'Delivered engagements must be reopened by an auditor before updating progress',
         );
+      if (input.progress === 100) await this.assertSignedOff(tx, id);
       await tx.engagement.update({
         where,
         data: {
@@ -302,6 +342,13 @@ export class EngagementsService {
 
     return withProgress(
       await this.prisma.$transaction(async (tx) => {
+        if (
+          (input.status === 'COMPLETE' || input.status === 'DELIVERED') &&
+          input.status !== current.status &&
+          current.status !== 'COMPLETE' &&
+          current.status !== 'DELIVERED'
+        )
+          await this.assertSignedOff(tx, id);
         const updated = await tx.engagement.update({
           where: { id, fiscalYearId: this.fiscal.id },
           data: {
@@ -370,6 +417,28 @@ export class EngagementsService {
         return updated;
       }),
     );
+  }
+
+  /** People the actor may @mention: auditors, the lead and assignees they can see. */
+  async participants(id: string, actor: CurrentUser) {
+    const engagement = await this.prisma.engagement.findFirstOrThrow({
+      where: { id, ...this.scope(actor) },
+      select: {
+        staffId: true,
+        subTasks: { select: { assignedToId: true } },
+      },
+    });
+    const seesAll = actor.role === 'AUDITOR' || engagement.staffId === actor.id;
+    const ids = new Set([
+      engagement.staffId,
+      actor.id,
+      ...(seesAll ? engagement.subTasks.map((task) => task.assignedToId) : []),
+    ]);
+    return this.prisma.user.findMany({
+      where: { OR: [{ role: 'AUDITOR' }, { id: { in: [...ids] } }] },
+      select: { id: true, name: true, role: true },
+      orderBy: [{ name: 'asc' }, { id: 'asc' }],
+    });
   }
 
   async activityFor(id: string, actor: CurrentUser) {

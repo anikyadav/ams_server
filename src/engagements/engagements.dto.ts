@@ -31,3 +31,9 @@ export class UpdateEngagementProgressDto extends createZodDto(
     comment: z.string().trim().min(1).max(2000).optional(),
   }),
 ) {}
+
+export class CloneEngagementsDto extends createZodDto(
+  z.strictObject({
+    sourceIds: z.array(z.string().trim().min(1)).min(1).max(100),
+  }),
+) {}

@@ -13,6 +13,10 @@ import { JwtService } from '@nestjs/jwt';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { setupApp } from '../src/setup-app';
+import { Workbook } from 'exceljs';
+import { randomBytes } from 'node:crypto';
+
+process.env.IRD_CREDENTIAL_ENCRYPTION_KEY = randomBytes(32).toString('hex');
 
 jest.setTimeout(60000);
 
@@ -40,6 +44,7 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
       connectionTimeoutMillis: 10000,
     });
     await db.connect();
+    await db.query('BEGIN');
     await db.query(`CREATE SCHEMA "${schema}"`);
     await db.query(`SET search_path TO "${schema}"`);
     const migrations = resolve(__dirname, '../prisma/migrations');
@@ -53,6 +58,7 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
       await db.query(migration.replaceAll('"public"', `"${schema}"`));
     }
     const url = new URL(process.env.DATABASE_URL);
+    await db.query('COMMIT');
     url.searchParams.set('schema', schema);
     prisma = new PrismaService(
       new ConfigService({ DATABASE_URL: url.toString() }),
@@ -225,7 +231,11 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
     });
 
     it('requires name, PAN and file location when creating a client', async () => {
-      const input = { name: 'Required fields', pan: '012345678', fileLocation: 'Shelf A' };
+      const input = {
+        name: 'Required fields',
+        pan: '012345678',
+        fileLocation: 'Shelf A',
+      };
       for (const field of ['name', 'pan', 'fileLocation'] as const) {
         const incomplete: Partial<typeof input> = { ...input };
         delete incomplete[field];
@@ -361,7 +371,7 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
         [method](path)
         .set('Authorization', bearer(auth))
         .set('X-Fiscal-Year-Id', 'fixture');
-    const create = async (staff = staffId) => {
+    const create = async (staff = staffId, keepTemplates = false) => {
       const response = await call('post', '/engagements')
         .send({
           clientId,
@@ -371,11 +381,22 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
           targetDate: '2026-12-31',
         })
         .expect(201);
-      return response.body as {
+      const record = response.body as {
         id: string;
         progress: number;
         natureOfWork: string;
+        subTasks: {
+          id: string;
+          templateKey: string;
+          title: string;
+          sortOrder: number;
+          assignedToId: string;
+        }[];
       };
+      // Existing cases exercise custom-task/empty-task scenarios deliberately.
+      if (!keepTemplates)
+        await prisma.subTask.deleteMany({ where: { engagementId: record.id } });
+      return record;
     };
 
     beforeAll(async () => {
@@ -398,6 +419,209 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
           },
         })
       ).id;
+    });
+
+    it('creates six ordered compulsory tasks and shares client IRD credentials across engagements', async () => {
+      const first = await create(staffId, true);
+      expect(first.subTasks.map((task) => task.title)).toEqual([
+        'Document',
+        'Vat Reco',
+        'Sales Reco',
+        'Purchase Reco',
+        'Sales Confirmation',
+        'Purchase Confirmation',
+      ]);
+      expect(first.subTasks.map((task) => task.sortOrder)).toEqual([
+        1, 2, 3, 4, 5, 6,
+      ]);
+      expect(
+        first.subTasks.every((task) => task.assignedToId === staffId),
+      ).toBe(true);
+      const docId = first.subTasks[0].id;
+      await call('delete', `/subtasks/${docId}`).expect(400);
+      const creationActivity = await call(
+        'get',
+        `/subtasks/${docId}/activity`,
+      ).expect(200);
+      expect(creationActivity.body).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ action: 'SUBTASK_CREATED' }),
+        ]),
+      );
+      await call('get', `/engagements/${first.id}/subtasks`)
+        .expect(200)
+        .expect((res) => {
+          expect(
+            (res.body as { sortOrder: number }[]).map((task) => task.sortOrder),
+          ).toEqual([1, 2, 3, 4, 5, 6]);
+        });
+      const path = `/subtasks/${docId}/document`;
+      const secret = '=secret-001+"test"';
+      const saved = await call('patch', path, workerToken)
+        .send({
+          registrationNo: '00123',
+          userId: '000987',
+          password: secret,
+          nextRenewalDate: '2026-10-07',
+        })
+        .expect(200);
+      expect(saved.body).toMatchObject({
+        registrationNo: '00123',
+        userId: '000987',
+        hasPassword: true,
+        nextRenewalDate: '2026-10-07T00:00:00.000Z',
+      });
+      expect(saved.text).not.toContain(secret);
+      expect(saved.text).not.toContain('passwordEncrypted');
+      const stored = await prisma.clientIrdCredential.findUniqueOrThrow({
+        where: { clientId },
+      });
+      expect(stored.passwordEncrypted).not.toContain(secret);
+      const docActivity = await call(
+        'get',
+        `/subtasks/${docId}/activity`,
+        workerToken,
+      ).expect(200);
+      expect(docActivity.text).toContain('1.1 Registration No.');
+      expect(docActivity.text).toContain('1.2 IRD user ID');
+      expect(docActivity.text).toContain('1.3 IRD password');
+      expect(docActivity.text).toContain('1.4 Next renewal date');
+      expect(docActivity.text).not.toContain(secret);
+      expect(docActivity.text).not.toContain('000987');
+      const second = await create(staffId, true);
+      await call('get', `/subtasks/${second.subTasks[0].id}/document`)
+        .expect(200)
+        .expect((res) =>
+          expect(res.body).toMatchObject({
+            userId: '000987',
+            hasPassword: true,
+          }),
+        );
+      const ordinary = await call('get', `/engagements/${first.id}`).expect(
+        200,
+      );
+      expect(ordinary.text).not.toContain(secret);
+      expect(ordinary.text).not.toContain('passwordEncrypted');
+      await call('patch', path).send({ registrationNo: '00456' }).expect(200);
+      const challenge = await call('post', `${path}/challenge`, workerToken)
+        .send({})
+        .expect(201);
+      const value = challenge.body as { token: string; question: string };
+      const answer = value.question
+        .split(' + ')
+        .map(Number)
+        .reduce((a, b) => a + b, 0);
+      await call('post', `${path}/reveal`, workerToken)
+        .send({ token: value.token, answer: answer + 1 })
+        .expect(400);
+      await call('post', `${path}/reveal`)
+        .send({ token: value.token, answer })
+        .expect(400);
+      await call('post', `${path}/reveal`, workerToken)
+        .send({ token: value.token, answer })
+        .expect(201)
+        .expect((res) => expect(res.body).toEqual({ password: secret }));
+      await prisma.subTask.update({
+        where: { id: docId },
+        data: { assignedToId: otherId },
+      });
+      await call('get', path, workerToken).expect(404);
+      await call('patch', path, workerToken)
+        .send({ password: 'blocked' })
+        .expect(404);
+      await call('post', `${path}/reveal`, workerToken)
+        .send({ token: value.token, answer })
+        .expect(404);
+      await request(server())
+        .get(path)
+        .set('Authorization', bearer(token))
+        .set('X-Fiscal-Year-Id', 'legacy')
+        .expect(404);
+      await call('patch', `/clients/${clientId}/ird-credentials`)
+        .send({ password: null, userId: null, nextRenewalDate: null })
+        .expect(200)
+        .expect((res) =>
+          expect(res.body).toMatchObject({
+            hasPassword: false,
+            userId: null,
+            nextRenewalDate: null,
+          }),
+        );
+      await call('delete', `/engagements/${first.id}`).expect(204);
+      await call('delete', `/engagements/${second.id}`).expect(204);
+      expect(
+        await prisma.clientIrdCredential.count({ where: { clientId } }),
+      ).toBe(1);
+    });
+
+    it('exports exact IRD credentials only for the selected fiscal year and only for auditors', async () => {
+      const secret = '=IRD-secret-0123';
+      await call('patch', `/clients/${clientId}/ird-credentials`)
+        .send({ userId: '0000123', password: secret })
+        .expect(200);
+      const challenge = await call(
+        'post',
+        '/clients/ird-credentials/export/challenge',
+      )
+        .send({})
+        .expect(201);
+      const value = challenge.body as { token: string; question: string };
+      const answer = value.question
+        .split(' + ')
+        .map(Number)
+        .reduce((a, b) => a + b, 0);
+      await call(
+        'post',
+        '/clients/ird-credentials/export/challenge',
+        workerToken,
+      )
+        .send({})
+        .expect(403);
+      await call('post', '/clients/ird-credentials/export', workerToken)
+        .send({ token: value.token, answer })
+        .expect(403);
+      await call('post', '/clients/ird-credentials/export')
+        .send({ token: value.token, answer: answer + 1 })
+        .expect(400);
+      await request(server())
+        .post('/clients/ird-credentials/export')
+        .set('Authorization', bearer(token))
+        .set('X-Fiscal-Year-Id', 'legacy')
+        .send({ token: value.token, answer })
+        .expect(400);
+      const result = await call('post', '/clients/ird-credentials/export')
+        .send({ token: value.token, answer })
+        .buffer(true)
+        .parse((res, callback) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => callback(null, Buffer.concat(chunks)));
+        })
+        .expect(201);
+      expect(result.headers['cache-control']).toBe('no-store');
+      const workbook = new Workbook();
+      await workbook.xlsx.load(
+        result.body as Parameters<typeof workbook.xlsx.load>[0],
+      );
+      const sheet = workbook.getWorksheet('IRD credentials')!;
+      const row = sheet
+        .getRows(2, sheet.rowCount - 1)!
+        .find((item) => item.getCell(1).value === 'Engagement Client')!;
+      expect(row.getCell(2).value).toBe('0000123');
+      expect(row.getCell(3).value).toBe(secret);
+      expect(row.getCell(3).type).toBe(3); // String, never an Excel formula.
+      expect(sheet.rowCount - 1).toBe(
+        await prisma.client.count({ where: { fiscalYearId: 'fixture' } }),
+      );
+      expect(
+        await prisma.irdCredentialAccessLog.count({
+          where: {
+            fiscalYearId: 'fixture',
+            actorId: auditorId,
+            action: 'IRD_CREDENTIALS_EXPORTED',
+          },
+        }),
+      ).toBe(1);
     });
 
     it('updates assigned engagement milestones without subtasks and shares completion with auditor', async () => {
@@ -693,7 +917,10 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
           natureOfWork: 'Workflow audit',
         })
         .expect(201);
-      return response.body as { id: string };
+      const record = response.body as { id: string };
+      // Isolate the custom-task scenarios below from automatic templates.
+      await prisma.subTask.deleteMany({ where: { engagementId: record.id } });
+      return record;
     };
     const createSubTask = async (
       engagementId: string,
@@ -1015,24 +1242,35 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
         `/engagements/${engagement.id}`,
         primaryToken,
       ).expect(200);
-      expect((primaryView.body as { subTasks: unknown[] }).subTasks).toHaveLength(2);
+      expect(
+        (primaryView.body as { subTasks: unknown[] }).subTasks,
+      ).toHaveLength(2);
 
       await call('get', `/subtasks/${mine.id}`, workerToken).expect(200);
-      await call('get', `/subtasks/${mine.id}/activity`, workerToken).expect(200);
+      await call('get', `/subtasks/${mine.id}/activity`, workerToken).expect(
+        200,
+      );
 
-      const inbox = await call('get', '/notifications', workerToken).expect(200);
+      const inbox = await call('get', '/notifications', workerToken).expect(
+        200,
+      );
       const body = inbox.body as {
         unreadCount: number;
         items: { id: string; type: string; subTaskId: string | null }[];
       };
       expect(body.items).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ type: 'TASK_ASSIGNED', subTaskId: mine.id }),
+          expect.objectContaining({
+            type: 'TASK_ASSIGNED',
+            subTaskId: mine.id,
+          }),
         ]),
       );
       expect(body.unreadCount).toBeGreaterThan(0);
       await call('post', '/notifications/read-all', workerToken).expect(204);
-      const after = await call('get', '/notifications', workerToken).expect(200);
+      const after = await call('get', '/notifications', workerToken).expect(
+        200,
+      );
       expect((after.body as { unreadCount: number }).unreadCount).toBe(0);
     });
 
@@ -1424,6 +1662,14 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
         startDate: '2026-09-19',
       })
       .expect(201);
+    await call('patch', `/clients/${json(c).id}/ird-credentials`, y1)
+      .send({
+        userId: '000001',
+        password: 'historic-IRD-password',
+        registrationNo: '000007',
+        nextRenewalDate: '2026-09-19',
+      })
+      .expect(200);
     const task = await call('post', `/engagements/${json(e).id}/subtasks`, y1)
       .send({ title: 'Historic task', assignedToId: staffId })
       .expect(201);
@@ -1448,6 +1694,51 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
       fileLocation: 'Archive A',
       location: 'Kathmandu',
     });
+    await call('get', `/clients/${rows(copied)[0].id}/ird-credentials`, y2)
+      .expect(200)
+      .expect((res) =>
+        expect(res.body).toMatchObject({
+          userId: '000001',
+          hasPassword: true,
+          registrationNo: '000007',
+          nextRenewalDate: '2026-09-19T00:00:00.000Z',
+        }),
+      );
+    const revealChallenge = await call(
+      'post',
+      `/clients/${rows(copied)[0].id}/ird-credentials/challenge`,
+      y2,
+    )
+      .send({})
+      .expect(201);
+    const challengeData = revealChallenge.body as {
+      token: string;
+      question: string;
+    };
+    await call(
+      'post',
+      `/clients/${rows(copied)[0].id}/ird-credentials/reveal`,
+      y2,
+    )
+      .send({
+        token: challengeData.token,
+        answer: challengeData.question
+          .split(' + ')
+          .map(Number)
+          .reduce((a, b) => a + b, 0),
+      })
+      .expect(201)
+      .expect((res) =>
+        expect(res.body).toEqual({ password: 'historic-IRD-password' }),
+      );
+    await call('patch', `/clients/${rows(copied)[0].id}/ird-credentials`, y2)
+      .send({ userId: 'changed-in-new-year' })
+      .expect(200);
+    await call('get', `/clients/${json(c).id}/ird-credentials`, y1)
+      .expect(200)
+      .expect((res) =>
+        expect((res.body as { userId: string }).userId).toBe('000001'),
+      );
     await call('get', '/engagements', y2).expect(200).expect([]);
     await call('patch', `/clients/${rows(copied)[0].id}`, y2)
       .send({ name: 'Changed in new year' })
@@ -1501,7 +1792,7 @@ describe('Real PostgreSQL API workflow (isolated schema)', () => {
     const historic = await call('get', `/engagements/${json(e).id}`, y1).expect(
       200,
     );
-    expect(json(historic).subTasks).toHaveLength(1);
+    expect(json(historic).subTasks).toHaveLength(7);
     expect(json(historic).comments[0].text).toBe('Historic evidence');
     expect(json(historic).startDate).toBe('2026-09-19T00:00:00.000Z');
     await call('post', '/fiscal-years')

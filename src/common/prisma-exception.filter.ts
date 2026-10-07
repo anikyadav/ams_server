@@ -1,9 +1,11 @@
-import { ArgumentsHost, Catch, ExceptionFilter } from '@nestjs/common';
+import { ArgumentsHost, Catch, ExceptionFilter, Logger } from '@nestjs/common';
 import type { Response } from 'express';
 import { Prisma } from '../generated/prisma/client';
 
 @Catch(Prisma.PrismaClientKnownRequestError)
 export class PrismaExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(PrismaExceptionFilter.name);
+
   catch(error: Prisma.PrismaClientKnownRequestError, host: ArgumentsHost) {
     const mapping: Record<string, [number, string]> = {
       P2002: [409, 'A record with that value already exists'],
@@ -15,6 +17,8 @@ export class PrismaExceptionFilter implements ExceptionFilter {
       500,
       'Database operation failed',
     ];
+    if (statusCode === 500)
+      this.logger.error(`${error.code}: ${error.message}`);
     host
       .switchToHttp()
       .getResponse<Response>()

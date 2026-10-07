@@ -19,12 +19,14 @@ import {
 import { Actor, Roles } from '../auth/access';
 import type { CurrentUser } from '../auth/access';
 import {
+  CloneEngagementsDto,
   CreateEngagementDto,
   UpdateEngagementDto,
   UpdateEngagementProgressDto,
 } from './engagements.dto';
 import { CreateSubTaskDto } from '../subtasks/subtasks.dto';
 import { EngagementsService } from './engagements.service';
+import { EngagementCloneService } from './engagement-clone.service';
 import { SubtasksService } from '../subtasks/subtasks.service';
 
 @ApiTags('Engagements')
@@ -34,6 +36,7 @@ export class EngagementsController {
   constructor(
     private readonly engagements: EngagementsService,
     private readonly subtasks: SubtasksService,
+    private readonly cloning: EngagementCloneService,
   ) {}
 
   @Get()
@@ -55,6 +58,15 @@ export class EngagementsController {
     return this.engagements.create(body, actor.id);
   }
 
+  @Post('clone')
+  @Roles('AUDITOR')
+  @ApiCreatedResponse({
+    description: 'Copy engagements from an earlier fiscal year into this one',
+  })
+  clone(@Body() body: CloneEngagementsDto, @Actor() actor: CurrentUser) {
+    return this.cloning.clone(body.sourceIds, actor);
+  }
+
   @Patch(':id/progress')
   @ApiOkResponse({ description: 'Update engagement milestone and discussion' })
   updateProgress(
@@ -74,6 +86,14 @@ export class EngagementsController {
     @Actor() actor: CurrentUser,
   ) {
     return this.engagements.update(id, body, actor.id);
+  }
+
+  @Get(':id/participants')
+  @ApiOkResponse({
+    description: 'People who can be @mentioned on an engagement',
+  })
+  participants(@Param('id') id: string, @Actor() actor: CurrentUser) {
+    return this.engagements.participants(id, actor);
   }
 
   @Get(':id/activity')

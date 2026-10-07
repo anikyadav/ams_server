@@ -12,12 +12,16 @@ import {
   Param,
   Post,
   Scope,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { REQUEST } from '@nestjs/core';
 import type { Request } from 'express';
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
-import { Roles } from '../auth/access';
+import { Actor, Roles } from '../auth/access';
+import type { CurrentUser } from '../auth/access';
+import { ConfigService } from '@nestjs/config';
+import { decryptDocument, encryptDocument } from '../subtasks/document-crypto';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable({ scope: Scope.REQUEST })
@@ -45,7 +49,10 @@ class AssignLegacyDto extends createZodDto(
 
 @Controller('fiscal-years')
 export class FiscalYearsController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {}
 
   @Get()
   list() {
@@ -89,7 +96,10 @@ export class FiscalYearsController {
 
   @Post()
   @Roles('AUDITOR')
-  async create(@Body() input: CreateFiscalYearDto) {
+  async create(
+    @Body() input: CreateFiscalYearDto,
+    @Actor() actor: CurrentUser,
+  ) {
     const startDate = new Date(input.startDate);
     const endDate = new Date(input.endDate);
     const index = fiscalBoundaries.findIndex(
@@ -100,39 +110,99 @@ export class FiscalYearsController {
         'Fiscal year must use supported 1 Shrawan boundaries (AD dates)',
       );
     }
-    return this.prisma.$transaction(async (tx) => {
-      if (input.copyFromId)
-        await tx.fiscalYear.findUniqueOrThrow({
-          where: { id: input.copyFromId },
+    return this.prisma.$transaction(
+      async (tx) => {
+        if (input.copyFromId)
+          await tx.fiscalYear.findUniqueOrThrow({
+            where: { id: input.copyFromId },
+          });
+        const overlap = await tx.fiscalYear.findFirst({
+          where: {
+            startDate: { lt: endDate },
+            endDate: { gt: startDate },
+          },
         });
-      const overlap = await tx.fiscalYear.findFirst({
-        where: {
-          startDate: { lt: endDate },
-          endDate: { gt: startDate },
-        },
-      });
-      if (overlap)
-        throw new ConflictException(
-          'This fiscal year already exists or overlaps an existing year',
-        );
-      const year = await tx.fiscalYear.create({ data: { startDate, endDate } });
-      if (input.copyFromId) {
-        const clients = await tx.client.findMany({
-          where: { fiscalYearId: input.copyFromId },
+        if (overlap)
+          throw new ConflictException(
+            'This fiscal year already exists or overlaps an existing year',
+          );
+        const year = await tx.fiscalYear.create({
+          data: { startDate, endDate },
         });
-        await tx.client.createMany({
-          data: clients.map((client) => ({
-            name: client.name,
-            pan: client.pan,
-            fileLocation: client.fileLocation,
-            location: client.location,
-            lineageId: client.lineageId,
-            fiscalYearId: year.id,
-          })),
-        });
-      }
-      return year;
-    });
+        if (input.copyFromId) {
+          const clients = await tx.client.findMany({
+            where: { fiscalYearId: input.copyFromId },
+            include: { irdCredential: true },
+          });
+          await tx.client.createMany({
+            data: clients.map((client) => ({
+              name: client.name,
+              pan: client.pan,
+              fileLocation: client.fileLocation,
+              location: client.location,
+              lineageId: client.lineageId,
+              fiscalYearId: year.id,
+            })),
+          });
+          const sources = clients.filter((client) => client.irdCredential);
+          if (sources.length) {
+            const copied = await tx.client.findMany({
+              where: { fiscalYearId: year.id },
+              select: { id: true, lineageId: true },
+            });
+            const ids = new Map(
+              copied.map((client) => [client.lineageId, client.id]),
+            );
+            const keyValue = this.config.get<string>(
+              'IRD_CREDENTIAL_ENCRYPTION_KEY',
+            );
+            if (
+              sources.some(
+                (client) => client.irdCredential?.passwordEncrypted,
+              ) &&
+              (!keyValue || !/^[a-fA-F0-9]{64}$/.test(keyValue))
+            )
+              throw new ServiceUnavailableException(
+                'IRD credential encryption is not configured',
+              );
+            await tx.clientIrdCredential.createMany({
+              data: sources.map((client) => {
+                const credential = client.irdCredential!;
+                const newId = ids.get(client.lineageId)!;
+                const key = keyValue ? Buffer.from(keyValue, 'hex') : null;
+                return {
+                  clientId: newId,
+                  registrationNo: credential.registrationNo,
+                  userId: credential.userId,
+                  nextRenewalDate: credential.nextRenewalDate,
+                  passwordEncrypted:
+                    credential.passwordEncrypted && key
+                      ? encryptDocument(
+                          decryptDocument(
+                            credential.passwordEncrypted,
+                            key,
+                            `ird-password:${client.id}`,
+                          ),
+                          key,
+                          `ird-password:${newId}`,
+                        )
+                      : null,
+                };
+              }),
+            });
+            await tx.irdCredentialAccessLog.create({
+              data: {
+                actorId: actor.id,
+                fiscalYearId: year.id,
+                action: 'IRD_CREDENTIALS_CARRIED_FORWARD',
+              },
+            });
+          }
+        }
+        return year;
+      },
+      { timeout: 15_000 },
+    );
   }
 }
 

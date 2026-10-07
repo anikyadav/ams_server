@@ -28,6 +28,12 @@ enum SubTaskStatus {
 }
 
 model User {
+  irdAccess IrdCredentialAccessLog[]
+  submittedTasks SubTask[] @relation("SubTaskSubmitter")
+  reviewedTasks SubTask[] @relation("SubTaskReviewer")
+  checklistDone TaskChecklistItem[] @relation("ChecklistDoneBy")
+  requestsCreated DocumentRequest[] @relation("RequestCreator")
+  requestsReceived DocumentRequest[] @relation("RequestReceiver")
   id           String       @id @default(cuid())
   name         String
   email        String       @unique
@@ -42,6 +48,7 @@ model User {
 }
 
 model FiscalYear {
+  irdAccess IrdCredentialAccessLog[]
   id String @id @default(cuid())
   startDate DateTime? @unique @db.Date
   endDate DateTime? @db.Date
@@ -51,6 +58,7 @@ model FiscalYear {
 }
 
 model Client {
+  irdCredential ClientIrdCredential?
   fiscalYearId String @default("legacy")
   fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Restrict)
   lineageId String @default(cuid())
@@ -81,6 +89,7 @@ model Engagement {
   targetDate   DateTime?
   priority     String?
   subTasks     SubTask[]
+  documentRequests DocumentRequest[]
   comments     Comment[]
   activity     ActivityLog[]
   notifications Notification[]
@@ -97,7 +106,33 @@ enum TaskPriority {
   URGENT
 }
 
+enum ReviewState {
+  NOT_SUBMITTED
+  SUBMITTED
+  CHANGES_REQUESTED
+  APPROVED
+}
+
+enum DocumentRequestStatus {
+  REQUESTED
+  RECEIVED
+}
+
 model SubTask {
+  reviewState ReviewState @default(NOT_SUBMITTED)
+  submittedAt DateTime?
+  submittedBy User? @relation("SubTaskSubmitter", fields: [submittedById], references: [id], onDelete: SetNull)
+  submittedById String?
+  reviewedAt DateTime?
+  reviewedBy User? @relation("SubTaskReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedById String?
+  reviewNote String?
+  blockedReason String?
+  blockedAt DateTime?
+  checklist TaskChecklistItem[]
+  @@unique([engagementId, templateKey])
+  templateKey String?
+  sortOrder Int @default(100)
   dueDate DateTime? @db.Date
   priority TaskPriority @default(MEDIUM)
   id           String        @id @default(cuid())
@@ -115,6 +150,62 @@ model SubTask {
 
   @@index([engagementId])
   @@index([assignedToId])
+}
+
+model TaskChecklistItem {
+  id String @id @default(cuid())
+  subTask SubTask @relation(fields: [subTaskId], references: [id], onDelete: Cascade)
+  subTaskId String
+  text String
+  done Boolean @default(false)
+  doneAt DateTime?
+  doneBy User? @relation("ChecklistDoneBy", fields: [doneById], references: [id], onDelete: SetNull)
+  doneById String?
+  sortOrder Int @default(100)
+  createdAt DateTime @default(now())
+
+  @@index([subTaskId])
+}
+
+model DocumentRequest {
+  id String @id @default(cuid())
+  engagement Engagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  engagementId String
+  title String
+  description String?
+  dueDate DateTime? @db.Date
+  status DocumentRequestStatus @default(REQUESTED)
+  reference String?
+  receivedAt DateTime?
+  receivedBy User? @relation("RequestReceiver", fields: [receivedById], references: [id], onDelete: SetNull)
+  receivedById String?
+  createdBy User @relation("RequestCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdById String
+  createdAt DateTime @default(now())
+
+  @@index([engagementId])
+}
+
+model ClientIrdCredential {
+  clientId String @id
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  registrationNo String? @db.VarChar(200)
+  userId String? @db.VarChar(200)
+  passwordEncrypted String?
+  nextRenewalDate DateTime? @db.Date
+  updatedAt DateTime @updatedAt
+}
+
+model IrdCredentialAccessLog {
+  id String @id @default(cuid())
+  actorId String
+  actor User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  fiscalYearId String
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Restrict)
+  clientId String?
+  action String
+  createdAt DateTime @default(now())
+  @@index([fiscalYearId, createdAt])
 }
 
 model Comment {

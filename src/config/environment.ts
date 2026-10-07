@@ -1,6 +1,10 @@
 import { z } from 'zod';
 
 export const environmentSchema = z.object({
+  IRD_CREDENTIAL_ENCRYPTION_KEY: z
+    .string()
+    .regex(/^[a-fA-F0-9]{64}$/, 'Must be a 32-byte hexadecimal key')
+    .optional(),
   NODE_ENV: z
     .enum(['development', 'test', 'production'])
     .default('development'),

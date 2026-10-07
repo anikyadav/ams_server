@@ -10,6 +10,7 @@ import type { CurrentUser } from '../auth/access';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CreateCommentDto, UpdateCommentDto } from './comments.dto';
+import { findMentions } from './mentions';
 
 const relations = {
   author: { select: safeUserSelect },
@@ -88,6 +89,37 @@ export class CommentsService {
       const task = scope.subTaskId
         ? engagement.subTasks.find((item) => item.id === scope.subTaskId)
         : undefined;
+      // People who can see this engagement and so may be @mentioned.
+      const people = await tx.user.findMany({
+        where: {
+          OR: [
+            { role: 'AUDITOR' },
+            {
+              id: {
+                in: [
+                  engagement.staffId,
+                  ...engagement.subTasks.map((item) => item.assignedToId),
+                ],
+              },
+            },
+          ],
+        },
+        select: { id: true, name: true },
+      });
+      const mentioned = findMentions(input.text, people).filter(
+        (user) => user.id !== actor.id,
+      );
+      if (mentioned.length)
+        await this.notifications.notify(tx, {
+          userIds: mentioned.map((user) => user.id),
+          actorId: actor.id,
+          type: 'MENTION',
+          title: `${actor.name} mentioned you`,
+          message: `${task ? `"${task.title}"` : engagement.client.name}: ${input.text.slice(0, 140)}`,
+          engagementId: scope.engagementId,
+          subTaskId: scope.subTaskId,
+        });
+      const mentionedIds = new Set(mentioned.map((user) => user.id));
       await this.notifications.notify(tx, {
         userIds: [
           ...(await this.notifications.auditorIds(tx)),
@@ -95,7 +127,7 @@ export class CommentsService {
           ...(task
             ? [task.assignedToId]
             : engagement.subTasks.map((item) => item.assignedToId)),
-        ],
+        ].filter((id) => !mentionedIds.has(id)),
         actorId: actor.id,
         type: 'COMMENT',
         title: task
